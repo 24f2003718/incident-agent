@@ -65,12 +65,13 @@ function parseEvidence(tr) {
   return out;
 }
 const compactCache = new Map();
-function compact(inc, catalog, evs) {
-  const key = sha(inc.transcript + canon(inc.allowedRootCauses));
+function compact(inc, catalog, evs, budget) {
+  budget = budget || LLM.budget;
+  const key = sha(inc.transcript + canon(inc.allowedRootCauses) + budget);
   if (compactCache.has(key)) return compactCache.get(key);
   let lines = evs.map((e) => ({ id: e.id, text: e.text.length > 420 ? e.text.slice(0, 420) + '...' : e.text }));
   const total = lines.reduce((a, l) => a + l.text.length + l.id.length + 4, 0);
-  if (total > LLM.budget) {
+  if (total > budget) {
     const words = new Set(['error', 'fail', 'timeout', 'exhaust', 'saturat', 'latency', 'p99', 'p95', 'deploy', 'rollback', 'release', 'flag', 'limit', 'max', 'replica', 'capacity', 'queue', 'pool', 'connection', 'oom', 'memory', 'cpu', '5xx', 'owner', 'page', 'policy', 'runbook', 'confirm', 'root', 'cause']);
     for (const c of inc.allowedRootCauses) c.toLowerCase().split(/[_\W]+/).forEach((w) => w.length > 3 && words.add(w));
     for (const t of catalog) (t.name + ' ' + (t.description || '')).toLowerCase().split(/[_\W]+/).forEach((w) => w.length > 4 && words.add(w));
@@ -80,7 +81,7 @@ function compact(inc, catalog, evs) {
       return { l, i, s };
     }).sort((a, b) => b.s - a.s || a.i - b.i);
     let used = 0; const keep = [];
-    for (const x of scored) { const c = x.l.text.length + x.l.id.length + 4; if (used + c > LLM.budget) continue; used += c; keep.push(x); }
+    for (const x of scored) { const c = x.l.text.length + x.l.id.length + 4; if (used + c > budget) continue; used += c; keep.push(x); }
     lines = keep.sort((a, b) => a.i - b.i).map((x) => x.l);
   }
   const text = lines.map((l) => `[${l.id}] ${l.text}`).join('\n');
@@ -145,11 +146,11 @@ Rules:
 }
 const PROVIDERS = [];
 (function () {
-  const add = (base, key, models) => { if (base && key) PROVIDERS.push({ base: base.replace(/\/$/, ''), key, models: models.filter(Boolean) }); };
-  add(LLM.base, LLM.key, LLM.models);
-  add(process.env.LLM2_BASE_URL, process.env.LLM2_API_KEY, [process.env.LLM2_MODEL, process.env.LLM2_FALLBACK_MODEL]);
+  const add = (base, key, models, budget) => { if (base && key) PROVIDERS.push({ base: base.replace(/\/$/, ''), key, models: models.filter(Boolean), budget }); };
+  add(LLM.base, LLM.key, LLM.models, LLM.budget);
+  add(process.env.LLM2_BASE_URL, process.env.LLM2_API_KEY, [process.env.LLM2_MODEL, process.env.LLM2_FALLBACK_MODEL], parseInt(process.env.LLM2_BUDGET || '7000', 10));
 })();
-async function callLLM(messages) {
+async function callLLM(mkMessages) {
   if (!PROVIDERS.length) { dbg('model:no_key'); throw new Error('no_key'); }
   const attempts = [];
   for (let i = 0; i < 2; i++) for (const p of PROVIDERS) if (p.models[i]) attempts.push({ p, model: p.models[i] });
@@ -163,14 +164,14 @@ async function callLLM(messages) {
       const r = await fetch(`${p.base}/chat/completions`, {
         method: 'POST', signal: ctl.signal,
         headers: { 'content-type': 'application/json', authorization: `Bearer ${p.key}` },
-        body: JSON.stringify({ model, messages, temperature: 0, max_completion_tokens: 2500, response_format: { type: 'json_object' }, ...(/gpt-oss|gemini/.test(model) ? { reasoning_effort: 'low' } : {}) }),
+        body: JSON.stringify({ model, messages: mkMessages(p.budget), temperature: 0, max_completion_tokens: 2500, response_format: { type: 'json_object' }, ...(/gpt-oss|gemini/.test(model) ? { reasoning_effort: 'low' } : {}) }),
       });
       clearTimeout(to);
       if (!r.ok) { let bt = ''; try { bt = (await r.text()).replace(/\s+/g, ' ').slice(0, 160); } catch {} last = new Error('http_' + r.status + ':' + model); dbg('model:http_' + r.status + ' ' + model + ' ' + bt); continue; }
       const j = await r.json();
       const txt = j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
       if (!txt) { last = new Error('empty_content:' + model); dbg('model:empty_content ' + model); continue; }
-      return { model, text: txt };
+      dbg('ok ' + model); return { model, text: txt };
     } catch (e) { clearTimeout(to); last = e; dbg('model:' + e.message + ' ' + model); }
   }
   throw last || new Error('llm_failed');
@@ -212,7 +213,9 @@ function normalizePlan(raw, body, evIds, secrets, lenient) {
   }
   const maxD = Math.min(3, body.policy.maximumDiagnostics);
   const diags = []; const seen = new Set();
-  for (const d of Array.isArray(raw.diagnostics) ? raw.diagnostics : []) {
+  const dArr = [raw.diagnostics, raw.diagnostic_tool_calls, raw.diagnosticToolCalls, raw.diagnostic_calls, raw.diagnosticCalls, raw.toolCalls, raw.tool_calls].find((x) => Array.isArray(x) && x.length) || [];
+  if (!dArr.length) dbg('raw_keys:' + Object.keys(raw).join(',').slice(0, 120));
+  for (const d of dArr) {
     const dn = d && (d.toolName || d.tool || d.name || d.tool_name);
     const tool = findTool(dn);
     if (!tool || eff.has(tool.name)) { dbg(`diag_reject:${String(dn).slice(0, 60)} ${!tool ? 'not_in_catalog' : 'is_effect'}; catalog=[${body.toolCatalog.map((t) => t.name).join(',')}] effects=[${body.policy.effectTools.join(',')}]`); continue; }
@@ -423,11 +426,10 @@ async function createIncident(body, headers, t0) {
       t0, agentStartNs: nowNs(), actions: {}, actionOrder: [], actionLog: [], receiptLog: [], receipts: {}, approvals: {}, suppressed: [], phase: 'diagnostics',
     };
     // exactly one model call
-    const text = compact(body.incident, body.toolCatalog, evs);
     run.chat = { startNs: nowNs(), model: (PROVIDERS[0] && PROVIDERS[0].models[0]) || LLM.models[0] };
     let plan, raw = null;
     try {
-      const r = await callLLM(buildPrompt(body, text)); run.chat.model = r.model;
+      const r = await callLLM((budget) => buildPrompt(body, compact(body.incident, body.toolCatalog, evs, budget))); run.chat.model = r.model;
       raw = parseJSONLoose(r.text);
       try { plan = normalizePlan(raw, body, evIds, secrets, false); } catch (e1) { dbg('strict:' + e1.message); plan = normalizePlan(raw, body, evIds, secrets, true); }
     } catch (e) {
@@ -507,7 +509,7 @@ async function handle(req) {
   const url = new URL(req.url, 'http://x'); const p = url.pathname.replace(/\/+$/, '') || '/';
   let m;
   if (req.method === 'GET' && p === '/') return J(200, { ok: true });
-  if (req.method === 'GET' && p === '/debug') return J(200, { llmKeySet: PROVIDERS.length > 0, providers: PROVIDERS.map((p) => ({ base: p.base, models: p.models })), budget: LLM.budget, errors: DBG });
+  if (req.method === 'GET' && p === '/debug') return J(200, { llmKeySet: PROVIDERS.length > 0, providers: PROVIDERS.map((p) => ({ base: p.base, models: p.models, budget: p.budget })), budget: LLM.budget, errors: DBG });
   if (req.method === 'GET' && (m = /^\/v2\/incidents\/([^/]+)$/.exec(p))) {
     const run = load(decodeURIComponent(m[1])); return run ? J(200, run.response) : fail(404, 'not_found');
   }
