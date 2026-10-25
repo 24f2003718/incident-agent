@@ -12,8 +12,8 @@ fs.mkdirSync(DATA_DIR, { recursive: true });
 const LLM = {
   base: (process.env.LLM_BASE_URL || 'https://api.groq.com/openai/v1').replace(/\/$/, ''),
   key: process.env.LLM_API_KEY || process.env.GROQ_API_KEY || '',
-  models: [process.env.LLM_MODEL || 'llama-3.3-70b-versatile', process.env.LLM_FALLBACK_MODEL || 'llama-3.1-8b-instant'],
-  budget: parseInt(process.env.PROMPT_CHAR_BUDGET || '36000', 10),
+  models: [process.env.LLM_MODEL || 'openai/gpt-oss-120b', process.env.LLM_FALLBACK_MODEL || 'openai/gpt-oss-20b'],
+  budget: parseInt(process.env.PROMPT_CHAR_BUDGET || '14000', 10),
 };
 const PROFILE = 'ga5-incident-agent/v2';
 const DESTRUCTIVE = ['rollback_deployment', 'disable_feature'];
@@ -153,11 +153,12 @@ async function callLLM(messages) {
       const r = await fetch(`${LLM.base}/chat/completions`, {
         method: 'POST', signal: ctl.signal,
         headers: { 'content-type': 'application/json', authorization: `Bearer ${LLM.key}` },
-        body: JSON.stringify({ model, messages, temperature: 0, max_tokens: 900, response_format: { type: 'json_object' } }),
+        body: JSON.stringify({ model, messages, temperature: 0, max_completion_tokens: 2500, response_format: { type: 'json_object' }, ...(/gpt-oss/.test(model) ? { reasoning_effort: 'low' } : {}) }),
       });
       clearTimeout(to);
       if (!r.ok) { last = new Error('http_' + r.status); if (r.status === 429 || r.status >= 500) continue; throw last; }
       const j = await r.json();
+      if (!(j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content)) { last = new Error('empty_content'); continue; }
       return { model, text: (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '' };
     } catch (e) { clearTimeout(to); last = e; }
   }
