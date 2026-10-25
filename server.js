@@ -97,7 +97,7 @@ function typeOK(t, v) {
     default: return true;
   }
 }
-function fixArgs(schema, args, inc) {
+function fixArgs(schema, args, inc, lenient) {
   args = isObj(args) ? { ...args } : {};
   const props = (schema && schema.properties) || {};
   if (schema && schema.properties) {
@@ -110,11 +110,11 @@ function fixArgs(schema, args, inc) {
     }
   }
   const required = (schema && schema.required) || [];
-  for (const r of required) if (!(r in args)) return null;
+  for (const r of required) if (!(r in args)) { if (lenient && inc.service && /service/i.test(r)) args[r] = inc.service; else if (!lenient) return null; }
   for (const [k, v] of Object.entries(args)) {
     const p = props[k]; if (!p) continue;
-    if (p.type && !typeOK(p.type, v)) return null;
-    if (Array.isArray(p.enum) && !p.enum.includes(v)) return null;
+    if (p.type && !typeOK(p.type, v)) { if (lenient) continue; return null; }
+    if (Array.isArray(p.enum) && !p.enum.includes(v)) { if (lenient) continue; return null; }
   }
   return args;
 }
@@ -168,7 +168,7 @@ function parseJSONLoose(t) {
   const a = t.indexOf('{'), b = t.lastIndexOf('}');
   return JSON.parse(t.slice(a, b + 1));
 }
-function normalizePlan(raw, body, evIds, secrets) {
+function normalizePlan(raw, body, evIds, secrets, lenient) {
   const inc = body.incident, cat = new Map(body.toolCatalog.map((t) => [t.name, t]));
   const eff = new Set(body.policy.effectTools);
   const rc = inc.allowedRootCauses.find((c) => c === raw.rootCause) || inc.allowedRootCauses.find((c) => String(raw.rootCause).toLowerCase() === c.toLowerCase());
@@ -180,16 +180,16 @@ function normalizePlan(raw, body, evIds, secrets) {
   const diags = []; const seen = new Set();
   for (const d of Array.isArray(raw.diagnostics) ? raw.diagnostics : []) {
     const tool = cat.get(d && d.toolName); if (!tool || eff.has(tool.name)) continue;
-    const args = fixArgs(tool.inputSchema, d.arguments, inc); if (!args) continue;
+    const args = fixArgs(tool.inputSchema, d.arguments, inc, lenient); if (!args) continue;
     const k = tool.name + canon(args); if (seen.has(k)) continue; seen.add(k);
     let ev = clean(d.evidence).filter((x) => evidence.includes(x)); if (!ev.length) ev = [evidence[0]];
     diags.push({ toolName: tool.name, arguments: args, evidence: ev });
     if (diags.length >= maxD) break;
   }
   if (!diags.length) throw new Error('diag');
-  const e = raw.effect || {}; const et = cat.get(e.toolName);
+  const e = raw.effect || {}; const et = cat.get(e.toolName) || (eff.has(e.toolName) ? { name: e.toolName, inputSchema: {} } : null);
   if (!et || !eff.has(et.name)) throw new Error('effect');
-  const eargs = fixArgs(et.inputSchema, e.arguments, inc); if (!eargs) throw new Error('effargs');
+  const eargs = fixArgs(et.inputSchema, e.arguments, inc, lenient); if (!eargs) throw new Error('effargs');
   let eev = clean(e.evidence).filter((x) => evidence.includes(x)); if (!eev.length) eev = evidence.slice(0, 2);
   const plan = { rootCause: rc, evidence, diagnostics: diags, effect: { toolName: et.name, arguments: eargs, evidence: eev } };
   const s = JSON.stringify(plan); for (const x of secrets) if (s.includes(x)) throw new Error('secret');
@@ -202,20 +202,33 @@ function heuristicPlan(body, evs) {
   let best = null;
   for (const c of inc.allowedRootCauses) { const sc = score(toks(c)); const tot = sc.reduce((a, x) => a + x.s, 0); if (!best || tot > best.tot) best = { c, tot, sc }; }
   const evidence = best.sc.sort((a, b) => b.s - a.s).slice(0, 3).map((x) => x.e.id);
+  if (evidence.length < 2) evidence.push(...evs.map((e) => e.id).filter((i) => !evidence.includes(i)).slice(0, 2 - evidence.length));
   const eff = new Set(body.policy.effectTools);
   const cw = toks(best.c);
-  const diagTools = body.toolCatalog.filter((t) => !eff.has(t.name)).map((t) => ({ t, s: toks(t.name + ' ' + (t.description || '')).filter((w) => cw.includes(w)).length })).sort((a, b) => b.s - a.s).slice(0, 2);
+  let pool = body.toolCatalog.filter((t) => !eff.has(t.name)); if (!pool.length) pool = body.toolCatalog;
+  const diagTools = pool.map((t) => ({ t, s: toks(t.name + ' ' + (t.description || '')).filter((w) => cw.includes(w)).length })).sort((a, b) => b.s - a.s).slice(0, 2);
   const fill = (t) => {
     const a = {}; const props = (t.inputSchema && t.inputSchema.properties) || {};
     for (const [k, p] of Object.entries(props)) a[k] = p.enum ? p.enum[0] : k === 'service' ? inc.service : p.type === 'integer' || p.type === 'number' ? 15 : /window|duration/.test(k) ? '15m' : String(inc.service || 'unknown');
-    return fixArgs(t.inputSchema, a, inc) || a;
+    return fixArgs(t.inputSchema, a, inc, true) || a;
   };
   const diagnostics = diagTools.map((x) => ({ toolName: x.t.name, arguments: fill(x.t), evidence: [evidence[0]] }));
   const cl = best.c.toLowerCase(); let want = /deploy|release|regress/.test(cl) ? 'rollback_deployment' : /flag|feature/.test(cl) ? 'disable_feature' : 'scale_service';
   if (!eff.has(want)) want = body.policy.effectTools[0];
-  const et = body.toolCatalog.find((t) => t.name === want);
+  const et = body.toolCatalog.find((t) => t.name === want) || { name: want, inputSchema: {} };
   return { rootCause: best.c, evidence, diagnostics, effect: { toolName: want, arguments: fill(et), evidence: evidence.slice(0, 2) } };
 }
+
+function lastResort(body, evs) {
+  const inc = body.incident, eff = body.policy.effectTools;
+  const tool = body.toolCatalog.find((t) => !eff.includes(t.name)) || body.toolCatalog[0];
+  const ids = evs.slice(0, 2).map((e) => e.id);
+  return { rootCause: inc.allowedRootCauses[0], evidence: ids,
+    diagnostics: [{ toolName: tool.name, arguments: inc.service ? { service: inc.service } : {}, evidence: [ids[0]] }],
+    effect: { toolName: eff[0], arguments: inc.service ? { service: inc.service } : {}, evidence: ids } };
+}
+const DBG = [];
+function dbg(m) { DBG.push(new Date().toISOString() + ' ' + String(m).slice(0, 200)); if (DBG.length > 60) DBG.shift(); console.error(m); }
 
 // ---------- state machine ----------
 function newDispatch(run, act, attempt, extra) {
@@ -362,13 +375,15 @@ async function createIncident(body, headers, t0) {
     // exactly one model call
     const text = compact(body.incident, body.toolCatalog, evs);
     run.chat = { startNs: nowNs(), model: LLM.models[0] };
-    let plan;
+    let plan, raw = null;
     try {
       const r = await callLLM(buildPrompt(body, text)); run.chat.model = r.model;
-      plan = normalizePlan(parseJSONLoose(r.text), body, evIds, secrets);
+      raw = parseJSONLoose(r.text);
+      try { plan = normalizePlan(raw, body, evIds, secrets, false); } catch (e1) { dbg('strict:' + e1.message); plan = normalizePlan(raw, body, evIds, secrets, true); }
     } catch (e) {
-      console.error('planner fallback:', e.message);
-      plan = normalizePlan(heuristicPlan(body, evs), body, evIds, secrets);
+      dbg('model:' + e.message);
+      try { plan = normalizePlan(heuristicPlan(body, evs), body, evIds, secrets, true); }
+      catch (e2) { dbg('heuristic:' + e2.message); plan = normalizePlan(lastResort(body, evs), body, evIds, secrets, true); }
     }
     run.chat.endNs = nowNs();
     run.plan = plan;
@@ -443,6 +458,7 @@ async function handle(req) {
   const url = new URL(req.url, 'http://x'); const p = url.pathname.replace(/\/+$/, '') || '/';
   let m;
   if (req.method === 'GET' && p === '/') return J(200, { ok: true });
+  if (req.method === 'GET' && p === '/debug') return J(200, { llmKeySet: !!LLM.key, base: LLM.base, models: LLM.models, budget: LLM.budget, errors: DBG });
   if (req.method === 'GET' && (m = /^\/v2\/incidents\/([^/]+)$/.exec(p))) {
     const run = load(decodeURIComponent(m[1])); return run ? J(200, run.response) : fail(404, 'not_found');
   }
@@ -457,7 +473,7 @@ async function handle(req) {
 }
 
 const server = http.createServer((req, res) => {
-  handle(req).then((r) => send(res, r.code, r.text)).catch((e) => { console.error(e); send(res, 500, '{"error":"internal_error"}'); });
+  handle(req).then((r) => send(res, r.code, r.text)).catch((e) => { dbg('500:' + (e && e.stack ? e.stack.split('\n').slice(0, 3).join(' | ') : e)); send(res, 500, '{"error":"internal_error"}'); });
 });
 function send(res, code, text) {
   res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'content-length': Buffer.byteLength(text) }); res.end(text);
