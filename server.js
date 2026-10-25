@@ -283,6 +283,9 @@ function lastResort(body, evs) {
 const DBG = [];
 function dbg(m) { DBG.push(new Date().toISOString() + ' ' + String(m).slice(0, 200)); if (DBG.length > 60) DBG.shift(); console.error(m); }
 
+const REQ = [], RUNS = [];
+function reqlog(o) { REQ.push({ t: new Date().toISOString().slice(11, 23), ...o }); if (REQ.length > 120) REQ.shift(); }
+
 // ---------- state machine ----------
 function newDispatch(run, act, attempt, extra) {
   const spanId = hex(8);
@@ -448,6 +451,13 @@ async function createIncident(body, headers, t0) {
     });
     run.response = waitingJSON(run, ctx);
     save(run);
+    try {
+      RUNS.push({ runId: run.runId, model: run.chat.model, service: body.incident.service, title: body.incident.title, allowed: body.incident.allowedRootCauses,
+        catalog: body.toolCatalog.map((t) => ({ name: t.name, description: String(t.description || '').slice(0, 160), schema: t.inputSchema })), effectTools: body.policy.effectTools,
+        diagnosis: run.diagnosis, evidenceLines: plan.evidence.map((id) => (evs.find((e) => e.id === id) || { id }).text.slice(0, 260)),
+        dispatches: ctx.dispatches.map((d) => ({ tool: d.toolName, args: d.arguments, ev: d.evidence })), effect: { tool: plan.effect.toolName, args: plan.effect.arguments, needsApproval: run.needsApproval } });
+      if (RUNS.length > 7) RUNS.shift();
+    } catch {}
     return J(200, run.response);
   });
 }
@@ -463,11 +473,19 @@ async function postReceipt(runId, body) {
     // validate everything first (no mutation on invalid input)
     const seenA = new Set(), seenP = new Set();
     for (const o of outs) {
-      if (!isObj(o) || !isStr(o.actionId) || !isStr(o.callId) || !Number.isInteger(o.attempt) || !Number.isInteger(o.status) || !isStr(o.nonce)) return fail(422, 'invalid_outcome');
+      if (!isObj(o) || !isStr(o.actionId)) return fail(422, 'invalid_outcome');
+      if (typeof o.status === 'string' && /^\d+$/.test(o.status)) o.status = parseInt(o.status, 10);
+      if (!Number.isInteger(o.status)) return fail(422, 'invalid_outcome_status');
       const a = run.actions[o.actionId];
-      if (!a || a.status !== 'pending' || a.callId !== o.callId || seenA.has(o.actionId)) return fail(422, 'unexpected_outcome');
+      if (!a) return fail(422, 'no_such_action');
+      if (a.status !== 'pending') return fail(422, 'action_not_pending');
+      if (seenA.has(o.actionId)) return fail(422, 'duplicate_outcome');
+      if (o.callId !== undefined && a.callId !== o.callId) return fail(422, 'callId_mismatch');
       const t = a.attempts[a.attempts.length - 1];
-      if (t.attempt !== o.attempt || t.status !== undefined) return fail(422, 'unexpected_outcome');
+      if (o.attempt === undefined) o.attempt = t.attempt;
+      if (t.attempt !== o.attempt || t.status !== undefined) return fail(422, 'attempt_mismatch');
+      if (!isStr(o.nonce)) o.nonce = '';
+      o.callId = a.callId;
       seenA.add(o.actionId);
     }
     for (const x of aps) {
@@ -509,16 +527,18 @@ async function handle(req) {
   const url = new URL(req.url, 'http://x'); const p = url.pathname.replace(/\/+$/, '') || '/';
   let m;
   if (req.method === 'GET' && p === '/') return J(200, { ok: true });
-  if (req.method === 'GET' && p === '/debug') return J(200, { llmKeySet: PROVIDERS.length > 0, providers: PROVIDERS.map((p) => ({ base: p.base, models: p.models, budget: p.budget })), budget: LLM.budget, errors: DBG });
+  if (req.method === 'GET' && p === '/debug') return J(200, { llmKeySet: PROVIDERS.length > 0, providers: PROVIDERS.map((p) => ({ base: p.base, models: p.models, budget: p.budget })), budget: LLM.budget, errors: DBG.slice(-25), requests: REQ.slice(-70), runs: RUNS });
   if (req.method === 'GET' && (m = /^\/v2\/incidents\/([^/]+)$/.exec(p))) {
-    const run = load(decodeURIComponent(m[1])); return run ? J(200, run.response) : fail(404, 'not_found');
+    const run = load(decodeURIComponent(m[1])); reqlog({ m: 'GET', p: '/v2/incidents/{id}', code: run ? 200 : 404 }); return run ? J(200, run.response) : fail(404, 'not_found');
   }
   if (req.method === 'POST' && (p === '/v2/incidents' || /^\/v2\/incidents\/[^/]+\/receipts$/.test(p))) {
     const chunks = []; let size = 0;
     for await (const c of req) { size += c.length; if (size > 25e6) return fail(413, 'too_large'); chunks.push(c); }
     let body; try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return fail(400, 'invalid_json'); }
-    if (p === '/v2/incidents') return createIncident(body, req.headers, t0);
-    return postReceipt(decodeURIComponent(p.split('/')[3]), body);
+    const lg = (r, x) => { let err; if (r.code >= 400) { try { err = JSON.parse(r.text).error; } catch {} } reqlog({ m: 'POST', p: p.replace(/^\/v2\/incidents\/[^/]+/, '/v2/incidents/{id}'), code: r.code, err, hdrTp: !!req.headers.traceparent, ...x }); return r; };
+    if (p === '/v2/incidents') return lg(await createIncident(body, req.headers, t0), { runId: body && body.runId });
+    const rid = decodeURIComponent(p.split('/')[3]);
+    return lg(await postReceipt(rid, body), { runId: rid, receiptId: body && body.receiptId, outs: ((body && body.outcomes) || []).map((o) => o && [o.actionId, o.attempt, o.status, o.resultClass || o.errorType]), aps: ((body && body.approvals) || []).map((a) => a && [a.approvalId, a.decision]) });
   }
   return fail(404, 'not_found');
 }
