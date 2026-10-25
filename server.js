@@ -143,24 +143,33 @@ Rules:
 - Never put secrets, tokens, or transcript prose into arguments.`;
   return [{ role: 'system', content: sys }, { role: 'user', content: `${JSON.stringify(user)}\n\nTRANSCRIPT:\n${text}` }];
 }
+const PROVIDERS = [];
+(function () {
+  const add = (base, key, models) => { if (base && key) PROVIDERS.push({ base: base.replace(/\/$/, ''), key, models: models.filter(Boolean) }); };
+  add(LLM.base, LLM.key, LLM.models);
+  add(process.env.LLM2_BASE_URL, process.env.LLM2_API_KEY, [process.env.LLM2_MODEL, process.env.LLM2_FALLBACK_MODEL]);
+})();
 async function callLLM(messages) {
-  if (!LLM.key) throw new Error('no_key');
-  let last, n = 0;
-  for (const model of LLM.models) {
-    if (n++ >= 2) break;
-    const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), n === 1 ? 9000 : 6000);
+  if (!PROVIDERS.length) throw new Error('no_key');
+  const attempts = [];
+  for (let i = 0; i < 2; i++) for (const p of PROVIDERS) if (p.models[i]) attempts.push({ p, model: p.models[i] });
+  const deadline = Date.now() + 15500; let last;
+  for (const { p, model } of attempts.slice(0, 4)) {
+    const left = deadline - Date.now(); if (left < 2500) break;
+    const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), Math.min(9000, left));
     try {
-      const r = await fetch(`${LLM.base}/chat/completions`, {
+      const r = await fetch(`${p.base}/chat/completions`, {
         method: 'POST', signal: ctl.signal,
-        headers: { 'content-type': 'application/json', authorization: `Bearer ${LLM.key}` },
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${p.key}` },
         body: JSON.stringify({ model, messages, temperature: 0, max_completion_tokens: 2500, response_format: { type: 'json_object' }, ...(/gpt-oss/.test(model) ? { reasoning_effort: 'low' } : {}) }),
       });
       clearTimeout(to);
-      if (!r.ok) { last = new Error('http_' + r.status); if (r.status === 429 || r.status >= 500) continue; throw last; }
+      if (!r.ok) { last = new Error('http_' + r.status + ':' + model); dbg('model:http_' + r.status + ' ' + model); continue; }
       const j = await r.json();
-      if (!(j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content)) { last = new Error('empty_content'); continue; }
-      return { model, text: (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '' };
-    } catch (e) { clearTimeout(to); last = e; }
+      const txt = j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
+      if (!txt) { last = new Error('empty_content:' + model); dbg('model:empty_content ' + model); continue; }
+      return { model, text: txt };
+    } catch (e) { clearTimeout(to); last = e; dbg('model:' + e.message + ' ' + model); }
   }
   throw last || new Error('llm_failed');
 }
@@ -172,6 +181,9 @@ function parseJSONLoose(t) {
 function normalizePlan(raw, body, evIds, secrets, lenient) {
   const inc = body.incident, cat = new Map(body.toolCatalog.map((t) => [t.name, t]));
   const eff = new Set(body.policy.effectTools);
+  const nm = (n) => String(n || '').toLowerCase().replace(/^functions[.:]/, '').replace(/[^a-z0-9]/g, '');
+  const findTool = (n) => cat.get(n) || body.toolCatalog.find((t) => nm(t.name) === nm(n));
+  const findEff = (n) => body.policy.effectTools.find((x) => x === n || nm(x) === nm(n));
   const rc = inc.allowedRootCauses.find((c) => c === raw.rootCause) || inc.allowedRootCauses.find((c) => String(raw.rootCause).toLowerCase() === c.toLowerCase());
   if (!rc) throw new Error('rc');
   const clean = (arr) => [...new Set((Array.isArray(arr) ? arr : []).map((x) => String(x).replace(/[\[\]\s]/g, '')).filter((x) => evIds.has(x)))];
@@ -180,17 +192,28 @@ function normalizePlan(raw, body, evIds, secrets, lenient) {
   const maxD = Math.min(3, body.policy.maximumDiagnostics);
   const diags = []; const seen = new Set();
   for (const d of Array.isArray(raw.diagnostics) ? raw.diagnostics : []) {
-    const tool = cat.get(d && d.toolName); if (!tool || eff.has(tool.name)) continue;
-    const args = fixArgs(tool.inputSchema, d.arguments, inc, lenient); if (!args) continue;
+    const dn = d && (d.toolName || d.tool || d.name || d.tool_name);
+    const tool = findTool(dn);
+    if (!tool || eff.has(tool.name)) { dbg(`diag_reject:${String(dn).slice(0, 60)} ${!tool ? 'not_in_catalog' : 'is_effect'}; catalog=[${body.toolCatalog.map((t) => t.name).join(',')}] effects=[${body.policy.effectTools.join(',')}]`); continue; }
+    const args = fixArgs(tool.inputSchema, d.arguments || d.args || d.input, inc, lenient); if (!args) continue;
     const k = tool.name + canon(args); if (seen.has(k)) continue; seen.add(k);
     let ev = clean(d.evidence).filter((x) => evidence.includes(x)); if (!ev.length) ev = [evidence[0]];
     diags.push({ toolName: tool.name, arguments: args, evidence: ev });
     if (diags.length >= maxD) break;
   }
-  if (!diags.length) throw new Error('diag');
-  const e = raw.effect || {}; const et = cat.get(e.toolName) || (eff.has(e.toolName) ? { name: e.toolName, inputSchema: {} } : null);
-  if (!et || !eff.has(et.name)) throw new Error('effect');
-  const eargs = fixArgs(et.inputSchema, e.arguments, inc, lenient); if (!eargs) throw new Error('effargs');
+  let hp = null; const getHP = () => hp || (hp = heuristicPlan(body, parseEvidence(inc.transcript)));
+  if (!diags.length) {
+    if (!lenient) throw new Error('diag');
+    for (const d of getHP().diagnostics.slice(0, maxD)) diags.push({ toolName: d.toolName, arguments: d.arguments, evidence: [evidence[0]] });
+    dbg('diag_repaired_with_heuristic');
+  }
+  const e = raw.effect || {}; const en = e.toolName || e.tool || e.name || e.tool_name; const ename = findEff(en);
+  let et = ename ? (findTool(ename) || { name: ename, inputSchema: {} }) : null;
+  let eargs = et ? fixArgs(et.inputSchema, e.arguments || e.args || e.input, inc, lenient) : null;
+  if (!et || !eargs) {
+    if (!lenient) throw new Error('effect');
+    const h = getHP().effect; et = { name: h.toolName }; eargs = h.arguments; dbg('effect_repaired_with_heuristic:' + String(en).slice(0, 40));
+  }
   let eev = clean(e.evidence).filter((x) => evidence.includes(x)); if (!eev.length) eev = evidence.slice(0, 2);
   const plan = { rootCause: rc, evidence, diagnostics: diags, effect: { toolName: et.name, arguments: eargs, evidence: eev } };
   const s = JSON.stringify(plan); for (const x of secrets) if (s.includes(x)) throw new Error('secret');
@@ -375,7 +398,7 @@ async function createIncident(body, headers, t0) {
     };
     // exactly one model call
     const text = compact(body.incident, body.toolCatalog, evs);
-    run.chat = { startNs: nowNs(), model: LLM.models[0] };
+    run.chat = { startNs: nowNs(), model: (PROVIDERS[0] && PROVIDERS[0].models[0]) || LLM.models[0] };
     let plan, raw = null;
     try {
       const r = await callLLM(buildPrompt(body, text)); run.chat.model = r.model;
@@ -459,7 +482,7 @@ async function handle(req) {
   const url = new URL(req.url, 'http://x'); const p = url.pathname.replace(/\/+$/, '') || '/';
   let m;
   if (req.method === 'GET' && p === '/') return J(200, { ok: true });
-  if (req.method === 'GET' && p === '/debug') return J(200, { llmKeySet: !!LLM.key, base: LLM.base, models: LLM.models, budget: LLM.budget, errors: DBG });
+  if (req.method === 'GET' && p === '/debug') return J(200, { llmKeySet: PROVIDERS.length > 0, providers: PROVIDERS.map((p) => ({ base: p.base, models: p.models })), budget: LLM.budget, errors: DBG });
   if (req.method === 'GET' && (m = /^\/v2\/incidents\/([^/]+)$/.exec(p))) {
     const run = load(decodeURIComponent(m[1])); return run ? J(200, run.response) : fail(404, 'not_found');
   }
@@ -479,5 +502,5 @@ const server = http.createServer((req, res) => {
 function send(res, code, text) {
   res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'content-length': Buffer.byteLength(text) }); res.end(text);
 }
-if (require.main === module) server.listen(PORT, () => console.log('listening on ' + PORT + (LLM.key ? '' : ' (NO LLM KEY: heuristic planner only)')));
+if (require.main === module) server.listen(PORT, () => console.log('listening on ' + PORT + (PROVIDERS.length ? '' : ' (NO LLM KEY: heuristic planner only)')));
 module.exports = { server };
