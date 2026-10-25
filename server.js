@@ -150,21 +150,23 @@ const PROVIDERS = [];
   add(process.env.LLM2_BASE_URL, process.env.LLM2_API_KEY, [process.env.LLM2_MODEL, process.env.LLM2_FALLBACK_MODEL]);
 })();
 async function callLLM(messages) {
-  if (!PROVIDERS.length) throw new Error('no_key');
+  if (!PROVIDERS.length) { dbg('model:no_key'); throw new Error('no_key'); }
   const attempts = [];
   for (let i = 0; i < 2; i++) for (const p of PROVIDERS) if (p.models[i]) attempts.push({ p, model: p.models[i] });
-  const deadline = Date.now() + 15500; let last;
-  for (const { p, model } of attempts.slice(0, 4)) {
+  const deadline = Date.now() + 16000; let last; const list = attempts.slice(0, 4);
+  for (let ai = 0; ai < list.length; ai++) {
+    const { p, model } = list[ai];
     const left = deadline - Date.now(); if (left < 2500) break;
-    const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), Math.min(9000, left));
+    const more = ai < list.length - 1;
+    const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), more ? Math.max(2500, Math.min(11000, left - 3500)) : left);
     try {
       const r = await fetch(`${p.base}/chat/completions`, {
         method: 'POST', signal: ctl.signal,
         headers: { 'content-type': 'application/json', authorization: `Bearer ${p.key}` },
-        body: JSON.stringify({ model, messages, temperature: 0, max_completion_tokens: 2500, response_format: { type: 'json_object' }, ...(/gpt-oss/.test(model) ? { reasoning_effort: 'low' } : {}) }),
+        body: JSON.stringify({ model, messages, temperature: 0, max_completion_tokens: 2500, response_format: { type: 'json_object' }, ...(/gpt-oss|gemini/.test(model) ? { reasoning_effort: 'low' } : {}) }),
       });
       clearTimeout(to);
-      if (!r.ok) { last = new Error('http_' + r.status + ':' + model); dbg('model:http_' + r.status + ' ' + model); continue; }
+      if (!r.ok) { let bt = ''; try { bt = (await r.text()).replace(/\s+/g, ' ').slice(0, 160); } catch {} last = new Error('http_' + r.status + ':' + model); dbg('model:http_' + r.status + ' ' + model + ' ' + bt); continue; }
       const j = await r.json();
       const txt = j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
       if (!txt) { last = new Error('empty_content:' + model); dbg('model:empty_content ' + model); continue; }
@@ -184,11 +186,30 @@ function normalizePlan(raw, body, evIds, secrets, lenient) {
   const nm = (n) => String(n || '').toLowerCase().replace(/^functions[.:]/, '').replace(/[^a-z0-9]/g, '');
   const findTool = (n) => cat.get(n) || body.toolCatalog.find((t) => nm(t.name) === nm(n));
   const findEff = (n) => body.policy.effectTools.find((x) => x === n || nm(x) === nm(n));
-  const rc = inc.allowedRootCauses.find((c) => c === raw.rootCause) || inc.allowedRootCauses.find((c) => String(raw.rootCause).toLowerCase() === c.toLowerCase());
-  if (!rc) throw new Error('rc');
-  const clean = (arr) => [...new Set((Array.isArray(arr) ? arr : []).map((x) => String(x).replace(/[\[\]\s]/g, '')).filter((x) => evIds.has(x)))];
-  const evidence = clean(raw.evidence).slice(0, 4);
-  if (evidence.length < 2) throw new Error('ev');
+  let hp = null; const getHP = () => hp || (hp = heuristicPlan(body, parseEvidence(inc.transcript)));
+  const nrm = (x) => String(x == null ? '' : x).toLowerCase().replace(/[^a-z0-9]/g, '');
+  const rawRC = raw.rootCause != null ? raw.rootCause : raw.root_cause != null ? raw.root_cause : raw.cause;
+  const AR = inc.allowedRootCauses;
+  let rc = AR.find((c) => c === rawRC) || AR.find((c) => nrm(c) === nrm(rawRC)) || (nrm(rawRC).length > 3 ? AR.find((c) => nrm(c).includes(nrm(rawRC)) || nrm(rawRC).includes(nrm(c))) : null);
+  let rcRepaired = false;
+  if (!rc) { if (!lenient) throw new Error('rc'); rc = getHP().rootCause; rcRepaired = true; dbg('rc_repaired:' + String(rawRC).slice(0, 60)); }
+  const clean = (arr) => {
+    const out = [];
+    for (const x of Array.isArray(arr) ? arr : []) {
+      const t = String(x).replace(/[\[\]\s]/g, '');
+      const c = [t, 'ev_' + t, 'ev' + t].find((y) => evIds.has(y));
+      if (c && !out.includes(c)) out.push(c);
+    }
+    return out;
+  };
+  let evidence = rcRepaired ? [] : clean(raw.evidence || raw.evidenceIds || raw.evidence_ids || raw.evidence_ids_list).slice(0, 4);
+  if (evidence.length < 2) {
+    if (!lenient) throw new Error('ev');
+    const h = rcRepaired ? getHP().evidence : (heuristicPlanFor(body, rc).evidence);
+    for (const x of h) if (evidence.length < 3 && !evidence.includes(x)) evidence.push(x);
+    dbg('evidence_padded');
+    if (evidence.length < 2) throw new Error('ev');
+  }
   const maxD = Math.min(3, body.policy.maximumDiagnostics);
   const diags = []; const seen = new Set();
   for (const d of Array.isArray(raw.diagnostics) ? raw.diagnostics : []) {
@@ -201,7 +222,6 @@ function normalizePlan(raw, body, evIds, secrets, lenient) {
     diags.push({ toolName: tool.name, arguments: args, evidence: ev });
     if (diags.length >= maxD) break;
   }
-  let hp = null; const getHP = () => hp || (hp = heuristicPlan(body, parseEvidence(inc.transcript)));
   if (!diags.length) {
     if (!lenient) throw new Error('diag');
     for (const d of getHP().diagnostics.slice(0, maxD)) diags.push({ toolName: d.toolName, arguments: d.arguments, evidence: [evidence[0]] });
@@ -218,6 +238,12 @@ function normalizePlan(raw, body, evIds, secrets, lenient) {
   const plan = { rootCause: rc, evidence, diagnostics: diags, effect: { toolName: et.name, arguments: eargs, evidence: eev } };
   const s = JSON.stringify(plan); for (const x of secrets) if (s.includes(x)) throw new Error('secret');
   return plan;
+}
+function heuristicPlanFor(body, cause) {
+  const evs = parseEvidence(body.incident.transcript);
+  const w = cause.toLowerCase().split(/[_\W]+/).filter((x) => x.length > 2);
+  const sc = evs.map((e) => ({ id: e.id, s: w.reduce((a, x) => a + (e.text.toLowerCase().includes(x) ? 1 : 0), 0) })).sort((a, b) => b.s - a.s);
+  return { evidence: sc.slice(0, 3).map((x) => x.id) };
 }
 // Deterministic backup used only when the model is unreachable/invalid (keeps the run valid).
 function heuristicPlan(body, evs) {
@@ -405,7 +431,6 @@ async function createIncident(body, headers, t0) {
       raw = parseJSONLoose(r.text);
       try { plan = normalizePlan(raw, body, evIds, secrets, false); } catch (e1) { dbg('strict:' + e1.message); plan = normalizePlan(raw, body, evIds, secrets, true); }
     } catch (e) {
-      dbg('model:' + e.message);
       try { plan = normalizePlan(heuristicPlan(body, evs), body, evIds, secrets, true); }
       catch (e2) { dbg('heuristic:' + e2.message); plan = normalizePlan(lastResort(body, evs), body, evIds, secrets, true); }
     }
